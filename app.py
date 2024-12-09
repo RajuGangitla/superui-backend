@@ -4,16 +4,11 @@ from dotenv import load_dotenv
 import os
 from pymongo import MongoClient
 import jwt
-import json
-import trafilatura
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.chrome.options import Options
-from urllib.parse import urlparse, urljoin
-from bson.objectid import ObjectId
-from datetime import datetime
-
+from bs4 import BeautifulSoup
+import requests
+from urllib.parse import urljoin
+import aiohttp
+from bson import ObjectId  # Import ObjectId to handle MongoDB's ObjectId type
 
 load_dotenv()
 
@@ -100,137 +95,82 @@ def get_user():
     print(request.user)
     return jsonify({"message": "User fetched successfully", "user": request.user})
 
+async def fetch_content(session, link):
+    """Fetch and clean content from all <p> tags in the given URL asynchronously."""
+    try:
+        async with session.get(link) as response:
+            response_text = await response.text()
+            soup = BeautifulSoup(response_text, "html.parser")
+            # Extract all <p> tags' text content
+            paragraphs = soup.find_all('p')
+            # Join and clean text from all <p> tags
+            content = " ".join(p.get_text(strip=True) for p in paragraphs)
+            return content if content else "No content found"
+    except Exception as e:
+        return f"Error fetching content: {str(e)}"
+
+async def parse_sidebar_item(item, base_url, session):
+    """Recursively parse sidebar items into the desired format, with content."""
+    link_tag = item.find("a")
+    if not link_tag or not link_tag.get("href"):  # Skip items without links
+        return None
+
+    name = item.get_text(strip=True)
+    relative_link = link_tag["href"]
+    full_link = urljoin(base_url, relative_link)  # Construct the full URL
+    content = await fetch_content(session, full_link)  # Fetch content asynchronously
+    children = []
+
+    sublist = item.find("ul")  # Look for nested lists
+    if sublist:
+        for subitem in sublist.find_all("li", recursive=False):
+            parsed_child = await parse_sidebar_item(subitem, base_url, session)
+            if parsed_child:  # Only add children that have links
+                children.append(parsed_child)
+
+    return {"name": name, "link": full_link, "content": content, "children": children}
+
 @app.route("/scrape_website", methods=["POST"])
-def scrape_website():
+async def scrape_website():
     data = request.json
     url = data.get('url')
-    
+
     if not url:
         return jsonify({"error": "No URL provided"}), 400
-    
+
     try:
-        # Get the current user from the request
-        current_user = request.user.get('user', {})
-        user_id = current_user.get('_id')
-        
-        if not user_id:
-            return jsonify({"error": "User not authenticated"}), 401
+        async with aiohttp.ClientSession() as session:
+            # Fetch the HTML content of the website
+            async with session.get(url) as response:
+                response_text = await response.text()
+                soup = BeautifulSoup(response_text, "html.parser")
 
-        # Use requests to fetch the page
-        import requests
-        from bs4 import BeautifulSoup
-        import re
-
-        # Send a request with user agent to mimic browser
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        response = requests.get(url, headers=headers)
-        
-        # Parse the HTML
-        soup = BeautifulSoup(response.text, 'html.parser')
-
-        def extract_doc_tree(soup):
-            # Try multiple selectors for sidebar
-            sidebar_selectors = [
-                'nav.sidebar',
-                'div.sidebar',
-                'aside.sidebar',
-                'nav.docs-sidebar',
-                'div.documentation-menu',
-                'aside'
-            ]
-
-            sidebar = None
-            for selector in sidebar_selectors:
-                sidebar = soup.select_one(selector)
-                if sidebar:
-                    break
-
+            # Adjust the selector based on the sidebar structure
+            sidebar = soup.select_one(".nextra-menu-desktop")
             if not sidebar:
-                return []
+                return jsonify({"error": "Sidebar not found"}), 404
 
-            def build_tree(element):
-                tree = []
-                
-                # Find all links in the sidebar
-                links = element.find_all('a', href=True)
-                
-                for link in links:
-                    href = link.get('href')
-                    # Handle relative URLs
-                    if href.startswith('/'):
-                        href = f"{url.rstrip('/')}{href}"
-                    
-                    # Try to get full page content
-                    try:
-                        page_response = requests.get(href, headers=headers)
-                        page_soup = BeautifulSoup(page_response.text, 'html.parser')
-                        
-                        # Try multiple content selectors
-                        content_selectors = [
-                            'main', 
-                            'article', 
-                            'div.content', 
-                            'div.documentation'
-                        ]
-                        
-                        content_element = None
-                        for content_selector in content_selectors:
-                            content_element = page_soup.select_one(content_selector)
-                            if content_element:
-                                break
-                        
-                        # Extract text content
-                        content = content_element.get_text(strip=True) if content_element else "No content found"
-                    
-                    except Exception as e:
-                        content = f"Error extracting content: {str(e)}"
-                    
-                    # Create node
-                    node = {
-                        "name": link.get_text(strip=True),
-                        "content": content,
-                        "children": []  # You can expand this for nested structures
-                    }
-                    
-                    tree.append(node)
-                
-                return tree
+            # Parse sidebar items
+            parsed_items = []
+            for item in sidebar.find_all("li", recursive=False):
+                parsed_item = await parse_sidebar_item(item, url, session)
+                if parsed_item:  # Only add items that have links
+                    parsed_items.append(parsed_item)
 
-            # Build and return the documentation tree
-            return build_tree(sidebar)
-
-        # Extract document tree
-        doc_tree = extract_doc_tree(soup)
-        
-        # Prepare document for MongoDB
-        scrape_document = {
-            "user_id": ObjectId(user_id),
-            "url": url,
-            "doc_tree": doc_tree,
-            "scraped_at": datetime.utcnow(),
-            "metadata": {
-                "total_pages": len(doc_tree),
-                "status": "completed"
+            result = {
+                "name": url, 
+                "baselink": url, 
+                "tree": parsed_items, 
+                "user_id":ObjectId(request.user.get("_id"))
             }
-        }
-        
-        # Insert into MongoDB
-        result = scraped_docs_collection.insert_one(scrape_document)
-        
-        return jsonify({
-            "message": "Documentation site scraped successfully",
-            "document_id": str(result.inserted_id),
-            "doc_tree": doc_tree,
-            "pages_count": len(doc_tree)
-        }), 200
-    
+            insert_result = scraped_docs_collection.insert_one(result)
+
+            return jsonify({
+                "acknowledged": True,
+                "inserted_id": str(insert_result.inserted_id)
+            })
     except Exception as e:
-        return jsonify({
-            "error": f"Scraping failed: {str(e)}",
-            "details": str(e)
-        }), 500
+        return jsonify({"error": "Scraping failed", "details": str(e)}), 500
     
 
 if __name__ == "__main__":
